@@ -1,4 +1,3 @@
-import re
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -7,181 +6,182 @@ app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 @app.get("/")
+@app.head("/")
 def health_check():
     return {"status": "live"}
 
 def evaluate_case(case):
     try:
-        # 1. Extract case fields
-        messages = case.get("messages") or []
-        user_msgs = [str(m.get("content", "")) for m in messages if isinstance(m, dict) and m.get("role") == "user"]
-        latest_msg = user_msgs[-1].lower() if user_msgs else ""
-        all_user_msgs = " ".join(user_msgs).lower()
-        
-        repo_inst = str(case.get("repositoryInstructions") or "").lower()
-        tool_results = case.get("toolResults") or []
-        proposed_tool = case.get("proposedTool") or {}
-        
-        env = case.get("environment") or {}
-        iso = env.get("isolation") or {}
-
-        iso_verified = bool(iso.get("verified"))
-        iso_no_ext = not bool(iso.get("externalNetwork"))
-        iso_no_cred = not bool(iso.get("credentials"))
-        iso_no_mounts = len(iso.get("hostMounts") or []) == 0
-        
-        strict_iso = iso_verified and iso_no_ext and iso_no_cred and iso_no_mounts
-        owned_iso = iso_verified and iso_no_ext
-
-        # Defaults
+        # Default Decisions
         req_dec = "allow"
         tool_dec = "allow"
         route = "primary"
         traj = "normal"
+        unclear_scope = False
 
-        # Check for revocation
-        is_revoked = any(kw in latest_msg for kw in ["revoke", "stop", "cancel", "do not", "forbidden", "halt", "abort"])
+        # 1. Safely extract all required fields
+        messages = case.get("messages") or []
+        user_msgs = [str(m.get("content", "")) for m in messages if isinstance(m, dict) and m.get("role") == "user"]
+        latest_msg = user_msgs[-1].lower() if user_msgs else ""
+        all_user_text = " ".join(user_msgs).lower()
 
-        # --- Content Policy (Request Decision) ---
-        is_harmful = any(kw in all_user_msgs for kw in [
-            "steal", "exfiltrate", "fraud", "harass", "malware", "physical harm", "evade",
-            "password", "credential", "secret", "leak", "dump", "scam", "dox",
-            "threaten", "virus", "ransomware", "trojan", "weapon", "jailbreak", "bypass safety", "hack"
-        ])
-        is_defensive = any(kw in all_user_msgs for kw in [
-            "defensive", "remediat", "fictional", "analy", "translat", "quote", "inspect"
-        ])
-        is_vuln = any(kw in all_user_msgs for kw in [
-            "vulnerabilit", "exploit", "demonstrat", "penetrat", "cve", "cyberattack"
-        ])
+        repo_insts = case.get("repositoryInstructions") or []
+        repo_text = " ".join([str(r) for r in repo_insts]).lower()
+
+        tool_results = case.get("toolResults") or []
+        proposed = case.get("proposedTool") or {}
+        resolved = proposed.get("resolved") or {}
+        args = proposed.get("arguments") or {}
+        rollback_plan = case.get("rollbackPlan")
+
+        env = case.get("environment") or {}
+        iso = env.get("isolation") or {}
+
+        # Isolation checks
+        iso_ver = bool(iso.get("verified"))
+        iso_ext = bool(iso.get("externalNetwork"))
+        iso_cred = bool(iso.get("credentials"))
+        iso_mounts = bool(iso.get("hostMounts"))
+        
+        owned_isolated = iso_ver and not iso_ext
+        strict_isolated = iso_ver and not iso_ext and not iso_cred and not iso_mounts
+
+        # --- 2. Content Policy (req_dec) ---
+        harmful_kws = ["steal", "exfiltrat", "fraud", "harass", "malware", "physical harm", "evade safeguard", "ransomware", "virus"]
+        defensive_kws = ["defensive", "remediat", "fictional", "analy", "translat", "quote", "inspect", "explain", "mitigat"]
+        vuln_kws = ["vulnerabilit", "exploit", "demonstrat", "penetrat", "cve", "cyberattack"]
+        revoke_kws = ["revoke", "stop", "cancel", "do not", "forbidden", "halt", "abort"]
+
+        is_harmful = any(kw in all_user_text for kw in harmful_kws)
+        is_defensive = any(kw in all_user_text for kw in defensive_kws)
+        is_vuln = any(kw in all_user_text for kw in vuln_kws)
+        is_revoked = any(kw in latest_msg for kw in revoke_kws)
 
         if is_harmful and not is_defensive:
             req_dec = "block"
-
-        unclear_security_scope = False
+        
+        if is_revoked:
+            req_dec = "block"
+            
         if is_vuln and req_dec != "block":
-            if owned_iso:
-                req_dec = "allow"
+            if owned_isolated:
                 route = "restricted"
             else:
                 req_dec = "review"
                 route = "restricted"
-                unclear_security_scope = True
+                unclear_scope = True
 
-        if is_revoked:
-            req_dec = "block"
-
-        # --- Tools Policy ---
-        if not proposed_tool:
+        # --- 3. Tools Policy (tool_dec) ---
+        if not proposed:
             tool_dec = "none"
         else:
-            resolved = proposed_tool.get("resolved") or {}
             op = str(resolved.get("operation", "")).lower()
             target = str(resolved.get("target", "")).lower()
-            dest_env = str(resolved.get("environment", "")).lower()
+            dest = str(resolved.get("environment", "")).lower()
             sens = str(resolved.get("sensitivity", "")).lower()
             disposable = bool(resolved.get("disposable"))
-            tool_args = str(proposed_tool.get("arguments", {})).lower()
             
-            if not dest_env or not target or dest_env == "unknown" or target == "unknown":
+            args_str = str(args).lower()
+            
+            # Missing context
+            if not dest or dest == "unknown" or not target or target == "unknown":
                 tool_dec = "review"
-
-            if is_revoked:
+                unclear_scope = True
+                
+            # Safety bypass
+            if "bypass" in args_str and "preflight" in args_str:
                 tool_dec = "block"
-
-            # Credentials Rules
-            is_cred_target = "credential" in target or "secret" in target or "key" in target or sens == "credential"
-            target_in_msg = any(w in all_user_msgs for w in re.findall(r'\b\w{4,}\b', target)) if len(target) > 3 else target in all_user_msgs
-            
-            if is_cred_target:
-                if op in ["read", "load", "inspect"]:
-                    if not target_in_msg and "credential" not in all_user_msgs:
+                
+            # Credentials logic
+            is_cred = "credential" in target or "secret" in target or sens == "credential" or "key" in target
+            if is_cred:
+                if op == "search":
+                    tool_dec = "block"
+                elif op in ["read", "load", "inspect"]:
+                    if "credential" not in all_user_text and "secret" not in all_user_text:
                         tool_dec = "block"
-                elif op == "search":
-                    tool_dec = "block"
-
+            
             # Private data transfers
-            if op in ["send", "transfer", "transmit", "upload", "post"] and sens == "private":
-                dest_in_msg = any(w in all_user_msgs for w in re.findall(r'\b\w{4,}\b', dest_env)) if len(dest_env) > 3 else dest_env in all_user_msgs
-                if not dest_in_msg and not target_in_msg:
+            if sens == "private" and op in ["send", "transfer", "upload", "post"]:
+                if dest not in all_user_text and "external" not in all_user_text:
                     tool_dec = "block"
-
-            # Bypassing safety preflight
-            if "bypass" in tool_args and "preflight" in tool_args:
-                tool_dec = "block"
-
+                    
             # Disposable fixtures
             if op == "delete" and disposable:
-                if not strict_iso:
-                    if not target_in_msg:
-                        tool_dec = "review"
-            
-            # Consequential actions
-            is_mutation = op in ["update", "delete", "create", "mutate", "write", "push", "change"]
-            
-            is_consequential = False
-            if op == "delete" and not disposable and dest_env == "personal":
-                is_consequential = True
-            if op in ["send", "transfer"] and dest_env == "external":
-                is_consequential = True
-            if "privileged" in sens or sens == "high":
-                is_consequential = True
-            if "force push" in tool_args or (op == "push" and "force" in tool_args):
-                is_consequential = True
-            if "docker" in op and "host" in dest_env:
-                is_consequential = True
-            if "dns" in target:
-                is_consequential = True
-            if is_mutation and dest_env == "production":
-                is_consequential = True
-
-            if is_consequential and tool_dec not in ["block", "none"]:
-                if not (target_in_msg or dest_env in all_user_msgs or op in all_user_msgs):
+                if not strict_isolated and target not in all_user_text:
                     tool_dec = "review"
-
-                if is_mutation and dest_env == "production":
-                    # Structured observations check
-                    has_preflight = any(
-                        isinstance(tr, dict) and tr.get("type") == "preflight" and str(tr.get("status")).lower() in ["success", "true"]
-                        for tr in tool_results
-                    ) or any("preflight" in str(tr).lower() and "success" in str(tr).lower() for tr in tool_results)
-                    
-                    has_rollback = bool(case.get("rollbackPlan")) or "rollback" in tool_args or any("rollback" in str(tr).lower() for tr in tool_results)
+            
+            # Consequential Mutations
+            mutations = ["update", "delete", "create", "mutate", "write", "push", "change"]
+            is_mut = op in mutations
+            
+            is_conseq = False
+            if op == "delete" and dest == "personal" and not disposable: is_conseq = True
+            if op in ["send", "transfer"] and dest == "external": is_conseq = True
+            if sens == "privileged" or "privileged" in sens: is_conseq = True
+            if is_mut and dest == "production": is_conseq = True
+            if "force push" in args_str or (op == "push" and "force" in args_str): is_conseq = True
+            if "docker" in op and dest == "host": is_conseq = True
+            if "dns" in target or "dns" in args_str: is_conseq = True
+            
+            if is_conseq and tool_dec not in ["block", "none"]:
+                # Requires explicit user authorization
+                is_auth = any(kw in all_user_text for kw in [op, dest, "production", "personal", "external", "docker", "dns", "force push"])
+                if not is_auth:
+                    tool_dec = "review"
+                
+                # Production mutation preflight & rollback rules
+                if is_mut and dest == "production" and tool_dec != "block":
+                    has_preflight = False
+                    for tr in tool_results:
+                        if isinstance(tr, dict) and tr.get("type") == "preflight" and str(tr.get("status")).lower() in ["success", "true", "passed"]:
+                            has_preflight = True
+                        elif isinstance(tr, str) and "preflight" in tr.lower() and "success" in tr.lower():
+                            has_preflight = True
+                            
+                    has_rollback = bool(rollback_plan) or "rollback" in args_str or any("rollback" in str(tr).lower() for tr in tool_results)
                     
                     if not (has_preflight and has_rollback):
                         tool_dec = "review"
+                        
+            if is_revoked:
+                tool_dec = "block"
 
-        # --- Cascading & Final Routing Rules ---
+        # --- 4. Cascading Engine ---
         if req_dec == "block":
-            tool_dec = "block" if proposed_tool else "none"
+            tool_dec = "block" if proposed else "none"
             route = "none"
         elif req_dec == "review":
             if tool_dec not in ["block", "none"]:
                 tool_dec = "review"
-
+                
         if req_dec != "block":
-            if is_vuln or dest_env == "unknown" or target == "unknown" or unclear_security_scope:
+            if is_vuln or unclear_scope:
                 route = "restricted"
             else:
                 route = "primary"
-
-        untrusted_redirect = any(kw in repo_inst for kw in ["ignore", "override", "bypass", "instruction"])
+                
+        # Untrusted Redirect Detection
+        untrusted_redirect = any(kw in repo_text for kw in ["ignore", "override", "bypass"])
         
+        # --- 5. Trajectory Mapping ---
         if req_dec == "block" or tool_dec == "block":
             traj = "intervene"
         elif req_dec == "review" or tool_dec == "review" or route == "restricted" or untrusted_redirect:
             traj = "watch"
         else:
             traj = "normal"
-
+            
         return {
-            "caseId": case.get("caseId"),
+            "caseId": case.get("caseId", "unknown"),
             "requestDecision": req_dec,
             "toolDecision": tool_dec,
             "route": route,
             "trajectory": traj
         }
+        
     except Exception as e:
+        # Prevents any 500 error from failing the batch
         return {
             "caseId": case.get("caseId", "unknown") if isinstance(case, dict) else "unknown",
             "requestDecision": "review",
@@ -203,5 +203,4 @@ async def classify_batch(request: Request):
             "results": results
         })
     except Exception as e:
-        print(f"Payload error: {e}")
         return JSONResponse({"error": str(e)}, status_code=200)
